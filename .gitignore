@@ -1,0 +1,8 @@
+# Hasil build PyInstaller (exe dibagikan lewat GitHub Releases)
+build/
+dist/
+*.spec
+SnipSimpan.exe
+
+__pycache__/
+*.pyc
