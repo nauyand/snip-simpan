@@ -46,13 +46,13 @@ from PySide6.QtCore import (
     QDir, QObject, QPoint, QPointF, QRect, QRectF, QSize, QStandardPaths, Qt, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QCursor, QDesktopServices, QFont, QGuiApplication, QIcon, QImage,
+    QAction, QActionGroup, QColor, QCursor, QDesktopServices, QFont, QGuiApplication, QIcon, QImage,
     QImageReader, QPainter, QPen, QPixmap, QRegion, QScreen,
 )
 from PySide6.QtNetwork import QAbstractSocket, QLocalServer, QLocalSocket, QNetworkInterface
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QPushButton, QSpinBox, QSystemTrayIcon, QTabWidget, QToolButton,
     QVBoxLayout, QWidget,
 )
@@ -263,6 +263,8 @@ def make_defaults() -> dict:
         "format": "PNG",
         "jpg_quality": 90,
         "date_subfolder": False,
+        "projects": [],
+        "active_project": "",
         "counter": 1,
         "fullscreen_target": "cursor",
         "delay": 0,
@@ -303,6 +305,14 @@ class Config(dict):
                 self[key] = value if isinstance(value, dict) else None
             elif key in self and type(value) is type(self[key]):
                 self[key] = value
+        names: List[str] = []
+        for name in self["projects"]:
+            name = clean_project_name(name) if isinstance(name, str) else ""
+            if name and name.lower() not in (n.lower() for n in names):
+                names.append(name)
+        self["projects"] = names
+        if self["active_project"] not in names:
+            self["active_project"] = ""
 
     def save(self) -> None:
         try:
@@ -317,14 +327,25 @@ class Config(dict):
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
-def render_name(template: str, now: datetime, counter: int, mode: str) -> str:
+def render_name(template: str, now: datetime, counter: int, mode: str, project: str = "") -> str:
     name = (template or "").strip() or "Screenshot_{tanggal}_{jam}"
     name = (name.replace("{tanggal}", now.strftime("%Y-%m-%d"))
                 .replace("{jam}", now.strftime("%H-%M-%S"))
                 .replace("{nomor}", f"{counter:04d}")
-                .replace("{mode}", mode))
-    name = _INVALID_CHARS.sub("_", name).strip(" .")
+                .replace("{mode}", mode)
+                .replace("{proyek}", project))
+    name = re.sub(r"([_\- ])\1+", r"\1", name)       # {proyek} kosong jangan sampai menyisakan "__"
+    name = _INVALID_CHARS.sub("_", name).strip(" ._-")
     return name or "Screenshot"
+
+
+_RESERVED_NAMES = re.compile(r"^(con|prn|aux|nul|com\d|lpt\d)$", re.I)
+
+
+def clean_project_name(text: str) -> str:
+    """Nama proyek yang aman dipakai sebagai nama folder Windows."""
+    name = re.sub(r"\s+", " ", _INVALID_CHARS.sub("-", text or "")).strip(" .")[:80]
+    return "" if _RESERVED_NAMES.match(name) else name
 
 
 class CaptureError(Exception):
@@ -1089,7 +1110,7 @@ class MainWindow(QMainWindow):
         self._build_tray()
 
         self._update_last_region_label()
-        self._update_name_preview()
+        self._refresh_project_ui()
         self.apply_hotkeys()
         if self.cfg["camera_autostart"]:
             self.start_phone()
@@ -1103,17 +1124,40 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(page)
 
         box = QGroupBox("Folder penyimpanan")
-        row = QHBoxLayout(box)
+        col = QVBoxLayout(box)
+        row = QHBoxLayout()
         self.folder_edit = QLineEdit(self.cfg["folder"])
         self.folder_edit.setToolTip("Semua screenshot langsung tersimpan di folder ini")
         self.folder_edit.editingFinished.connect(self._folder_edited)
         choose = QPushButton("Pilih…")
         choose.clicked.connect(self.choose_folder)
         open_btn = QPushButton("Buka")
-        open_btn.clicked.connect(self.open_folder)
+        open_btn.clicked.connect(self.open_project_folder)
         row.addWidget(self.folder_edit, 1)
         row.addWidget(choose)
         row.addWidget(open_btn)
+        col.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Proyek:"))
+        self.project_combo = QComboBox()
+        self.project_combo.setToolTip("Pilih proyek: screenshot & foto HP masuk ke subfolder bernama proyek itu.\n"
+                                      "Pilih \"Normal\" untuk kembali seperti biasa.")
+        self.project_combo.currentIndexChanged.connect(
+            lambda _i: self.set_project(self.project_combo.currentData() or ""))
+        row.addWidget(self.project_combo, 1)
+        new_btn = QPushButton("+ Proyek baru")
+        new_btn.clicked.connect(self.new_project)
+        row.addWidget(new_btn)
+        self.remove_project_button = QToolButton()
+        self.remove_project_button.setText("✕")
+        self.remove_project_button.setToolTip("Hapus proyek ini dari daftar (folder & file tidak dihapus)")
+        self.remove_project_button.clicked.connect(self.remove_project)
+        row.addWidget(self.remove_project_button)
+        col.addLayout(row)
+        self.project_target = QLabel()
+        self.project_target.setWordWrap(True)
+        self.project_target.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        col.addWidget(self.project_target)
         lay.addWidget(box)
 
         box = QGroupBox("Ambil screenshot — langsung tersimpan, tanpa dialog")
@@ -1329,8 +1373,11 @@ class MainWindow(QMainWindow):
         self._update_camera_name_preview()
 
     def _update_camera_name_preview(self) -> None:
-        name = render_name(self.cfg["camera_template"], datetime.now(), self.cfg["counter"], "kamera")
-        self.camera_name_preview.setText(name + ".jpg")
+        now = datetime.now()
+        name = render_name(self.cfg["camera_template"], now, self.cfg["counter"], "kamera",
+                           self.cfg["active_project"])
+        sub = self._subfolder(now)
+        self.camera_name_preview.setText((sub + os.sep if sub else "") + name + ".jpg")
 
     def _phone_url(self) -> str:
         ip = self.ip_combo.currentData()
@@ -1406,6 +1453,7 @@ class MainWindow(QMainWindow):
             req["event"].set()
             self.notify(f"Foto dari HP gagal disimpan: {exc}", error=True)
             return
+        req["project"] = self.cfg["active_project"]
         self.pending[path] = (None, False)
         self.phone_paths.add(path)
         self.executor.submit(self._write_phone_file, req, path)
@@ -1416,7 +1464,8 @@ class MainWindow(QMainWindow):
             with open(path, "xb") as fh:        # "x": jangan pernah menimpa file yang sudah ada
                 fh.write(req["data"])
             ok = True
-            req["name"] = Path(path).name
+            project = req.get("project") or ""
+            req["name"] = f"{project}/{Path(path).name}" if project else Path(path).name
         except OSError as exc:
             req["error"] = f"Gagal menulis file di PC: {exc.strerror or exc}"
         req["event"].set()                      # balas ke HP secepatnya; pratinjau menyusul
@@ -1492,7 +1541,7 @@ class MainWindow(QMainWindow):
         self.template_edit = QLineEdit(self.cfg["template"])
         self.template_edit.textChanged.connect(self._template_changed)
         form.addRow("Pola nama:", self.template_edit)
-        tokens = QLabel("{tanggal} = 2026-11-16 · {jam} = 14-30-05 · {nomor} = 0001 · {mode} = layar / area / jendela / kamera")
+        tokens = QLabel("{tanggal} = 2026-11-16 · {jam} = 14-30-05 · {nomor} = 0001 · {mode} = layar / area / jendela / kamera · {proyek} = nama proyek aktif")
         tokens.setObjectName("muted")
         tokens.setWordWrap(True)
         form.addRow("", tokens)
@@ -1521,9 +1570,10 @@ class MainWindow(QMainWindow):
         fmt_row.addWidget(self.quality_spin)
         fmt_row.addStretch(1)
         form.addRow("Format:", fmt_row)
-        date_sub = QCheckBox("Buat subfolder per tanggal (mis. …\\2026-11-16\\)")
+        date_sub = QCheckBox("Mode Normal: buat subfolder per tanggal (mis. …\\2026-11-16\\)")
         date_sub.setChecked(self.cfg["date_subfolder"])
-        date_sub.toggled.connect(lambda v: (self._set("date_subfolder", v), self._update_name_preview()))
+        date_sub.setToolTip("Hanya berlaku di mode Normal. Saat proyek dipilih, file masuk ke folder proyek.")
+        date_sub.toggled.connect(lambda v: (self._set("date_subfolder", v), self._refresh_project_ui()))
         form.addRow("", date_sub)
         lay.addWidget(box)
 
@@ -1582,6 +1632,8 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _=False, a=action: self.on_action(a))
             self.tray_actions[action] = act
         menu.addSeparator()
+        self.project_menu = menu.addMenu("Proyek: Normal")
+        self._fill_project_menu()
         self.tray_phone_action = menu.addAction("Aktifkan kamera HP")
         self.tray_phone_action.triggered.connect(self.toggle_phone)
         menu.addAction("Buka folder screenshot").triggered.connect(self.open_folder)
@@ -1607,6 +1659,7 @@ class MainWindow(QMainWindow):
         text = self.folder_edit.text().strip()
         if text and text != self.cfg["folder"]:
             self._set("folder", text)
+            self._refresh_project_ui()
 
     def choose_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Pilih folder penyimpanan screenshot", self.cfg["folder"])
@@ -1614,6 +1667,7 @@ class MainWindow(QMainWindow):
             folder = QDir.toNativeSeparators(folder)
             self.folder_edit.setText(folder)
             self._set("folder", folder)
+            self._refresh_project_ui()
             self.notify(f"Folder penyimpanan: {folder}")
 
     def _template_changed(self, text: str) -> None:
@@ -1630,10 +1684,112 @@ class MainWindow(QMainWindow):
         self._update_name_preview()
 
     def _update_name_preview(self) -> None:
-        name = render_name(self.cfg["template"], datetime.now(), self.cfg["counter"], "layar")
+        now = datetime.now()
+        name = render_name(self.cfg["template"], now, self.cfg["counter"], "layar", self.cfg["active_project"])
         ext = ".jpg" if self.cfg["format"] == "JPG" else ".png"
-        prefix = datetime.now().strftime("%Y-%m-%d") + os.sep if self.cfg["date_subfolder"] else ""
-        self.name_preview.setText(prefix + name + ext)
+        sub = self._subfolder(now)
+        self.name_preview.setText((sub + os.sep if sub else "") + name + ext)
+
+    # ── Proyek (subfolder pilihan sendiri) ───────────────────────────────────
+    def _subfolder(self, now: datetime) -> str:
+        """Subfolder tujuan: proyek aktif jika ada; kalau tidak, per tanggal (jika dicentang) atau langsung."""
+        project = self.cfg["active_project"]
+        if project:
+            return project
+        return now.strftime("%Y-%m-%d") if self.cfg["date_subfolder"] else ""
+
+    def set_project(self, name: str) -> None:
+        name = clean_project_name(name)
+        if name and name not in self.cfg["projects"]:
+            name = ""
+        if name == self.cfg["active_project"]:
+            self._refresh_project_ui()
+            return
+        self._set("active_project", name)
+        self._refresh_project_ui()
+        self.notify(f"Proyek aktif: {name}. Screenshot masuk ke subfolder \"{name}\"." if name
+                    else "Kembali ke mode normal (tanpa proyek).", important=True)
+
+    def new_project(self) -> None:
+        if not self.isVisible():
+            self.show_normal()
+        text, ok = QInputDialog.getText(self, "Proyek baru",
+                                        "Nama proyek (menjadi nama subfolder di folder penyimpanan):")
+        name = clean_project_name(text) if ok else ""
+        if not ok:
+            return
+        if not name:
+            QMessageBox.warning(self, APP_NAME, "Nama proyek tidak valid. Gunakan huruf, angka, spasi, atau - _")
+            return
+        existing = next((p for p in self.cfg["projects"] if p.lower() == name.lower()), None)
+        if existing is None:
+            self.cfg["projects"].append(name)
+            self.cfg["projects"].sort(key=str.lower)
+            self.cfg.save()
+            existing = name
+        self.set_project(existing)
+
+    def remove_project(self) -> None:
+        name = self.cfg["active_project"]
+        if not name:
+            return
+        answer = QMessageBox.question(
+            self, APP_NAME, f"Hapus \"{name}\" dari daftar proyek?\n\n"
+                            "Folder dan file di dalamnya TIDAK dihapus.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.cfg["projects"] = [p for p in self.cfg["projects"] if p != name]
+        self.cfg.save()
+        self.set_project("")
+
+    def open_project_folder(self) -> None:
+        folder = self._base_folder() / self._subfolder(datetime.now())
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.notify(f"Folder tidak bisa dibuat: {exc}", error=True)
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def _refresh_project_ui(self) -> None:
+        active = self.cfg["active_project"]
+        combo = self.project_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Normal (tanpa proyek)", "")
+        for name in self.cfg["projects"]:
+            combo.addItem(f"📁 {name}", name)
+        combo.setCurrentIndex(max(0, combo.findData(active)))
+        combo.blockSignals(False)
+        self.remove_project_button.setEnabled(bool(active))
+        sub = self._subfolder(datetime.now())
+        target = QDir.toNativeSeparators(str(self._base_folder() / sub)) if sub else self.cfg["folder"]
+        note = "" if active else ("  (subfolder per tanggal)" if self.cfg["date_subfolder"] else "")
+        self.project_target.setText(f"Tersimpan ke: {target}{note}")
+        self.project_target.setStyleSheet("color: #2563eb; font-weight: 600;" if active else "")
+        self.setWindowTitle(f"{APP_NAME} — {active}" if active else APP_NAME)
+        if hasattr(self, "tray"):
+            if not self.auto_timer.isActive():
+                self.tray.setToolTip(f"{APP_NAME} — proyek: {active}" if active else APP_NAME)
+            self._fill_project_menu()
+        self._update_name_preview()
+        if hasattr(self, "camera_name_preview"):
+            self._update_camera_name_preview()
+
+    def _fill_project_menu(self) -> None:
+        menu = self.project_menu
+        menu.clear()
+        active = self.cfg["active_project"]
+        menu.setTitle(f"Proyek: {active}" if active else "Proyek: Normal")
+        group = QActionGroup(menu)
+        for label, name in [("Normal (tanpa proyek)", "")] + [(p, p) for p in self.cfg["projects"]]:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(name == active)
+            act.setActionGroup(group)
+            act.triggered.connect(lambda _=False, n=name: self.set_project(n))
+        menu.addSeparator()
+        menu.addAction("Proyek baru…").triggered.connect(self.new_project)
 
     def _auto_interval_changed(self, value: int) -> None:
         self._set("auto_interval", value)
@@ -1835,15 +1991,17 @@ class MainWindow(QMainWindow):
             raise CaptureError("Folder penyimpanan belum dipilih")
         folder = Path(os.path.expandvars(folder_text)).expanduser()
         now = datetime.now()
-        if self.cfg["date_subfolder"]:
-            folder = folder / now.strftime("%Y-%m-%d")
+        sub = self._subfolder(now)
+        if sub:
+            folder = folder / sub
         try:
             folder.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise CaptureError(f"Folder tidak bisa dibuat: {folder} ({exc.strerror or exc})") from exc
         if template is None:
             template = self.cfg["template"]
-        stem = render_name(template, now, self.cfg["counter"], MODE_TOKEN.get(mode, mode))
+        stem = render_name(template, now, self.cfg["counter"], MODE_TOKEN.get(mode, mode),
+                           self.cfg["active_project"])
         if "{nomor}" in template:
             self.cfg["counter"] += 1
             self.cfg.save()
@@ -1943,7 +2101,8 @@ class MainWindow(QMainWindow):
             return
         self.auto_timer.stop()
         self._refresh_hotkey_hints()
-        self.tray.setToolTip(APP_NAME)
+        project = self.cfg["active_project"]
+        self.tray.setToolTip(f"{APP_NAME} — proyek: {project}" if project else APP_NAME)
         self.notify(f"Otomatis berhenti — {self.auto_count} screenshot tersimpan.", important=True)
         if self.auto_hid:
             self.auto_hid = False

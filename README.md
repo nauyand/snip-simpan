@@ -53,11 +53,24 @@ Atur di tab **Pengaturan → Pola nama**. Kode yang bisa dipakai:
 - `{jam}`: 14-30-05
 - `{nomor}`: 0001, 0002, … (nomor urut, bisa di-reset)
 - `{mode}`: layar / area / jendela / kamera
+- `{proyek}`: nama proyek yang sedang aktif (kosong di mode Normal)
 
 Contoh pola: `Laporan_{nomor}` menghasilkan `Laporan_0001.png`, `Laporan_0002.png`, dan seterusnya.
 Jika ada nama yang sama, aplikasi otomatis menambahkan `_2`, `_3`, dan seterusnya, jadi tidak ada file yang tertimpa.
 
 Pilihan lain: format PNG atau JPG, subfolder per tanggal, jeda sebelum mengambil, salin ke clipboard, notifikasi, dan bunyi.
+
+### Proyek (subfolder pilihan sendiri)
+Kelompokkan screenshot berdasarkan pekerjaan, bukan tanggal.
+
+1. Di tab **Screenshot**, klik **+ Proyek baru**, lalu beri nama, misalnya `Project A`.
+2. Selama proyek itu aktif, semua screenshot **dan foto dari HP** masuk ke `…\folder penyimpanan\Project A\`.
+   Judul jendela dan tooltip tray menampilkan proyek yang sedang aktif.
+3. Selesai? Pilih **Normal (tanpa proyek)** dan penyimpanan kembali seperti biasa
+   (langsung di folder, atau per tanggal jika opsi subfolder per tanggal dicentang).
+
+Proyek bisa diganti cepat lewat menu tray **Proyek: …**, tanpa membuka jendela. Daftar proyek tetap tersimpan,
+jadi nanti tinggal dipilih lagi. Tombol **✕** hanya menghapus proyek dari daftar; folder dan filenya tidak ikut terhapus.
 
 ### Kamera HP (tanpa aplikasi di HP)
 Foto dengan kamera HP, hasilnya langsung masuk ke folder yang sama di PC.
